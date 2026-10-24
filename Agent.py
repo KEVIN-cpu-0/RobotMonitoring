@@ -1,33 +1,33 @@
 """
-Agent that monitors an Arduino and records every non-OK assessment on
-Solana (devnet by default) via the Memo program.
+Robot Monitoring agent.
 
-Readings are checked by Claude when an API key is set, or by built-in rules
-when it isn't (free, works offline, less detailed explanations).
+Start it from the folder that holds this file:
 
-Setup:
-    pip install pyserial solana solders
-    pip install anthropic                      optional, only for Claude
-    export ANTHROPIC_API_KEY=your_key          optional (Windows PowerShell:
-                                               $env:ANTHROPIC_API_KEY="your_key")
+    python3 Agent.py          (Windows: py Agent.py)
 
-Run one of:
-    python Agent.py --port /dev/ttyACM0        the agent reads the Arduino itself
-    python Agent.py --listen 8765              dashboard.html reads the Arduino in
-                                               the browser and posts readings here
+It listens on http://localhost:8765. dashboard.html (served separately, e.g.
+with  python3 -m http.server 8000) reads the Arduino over USB in Chrome and
+sends readings here to be checked. That needs nothing but Python: no packages,
+no API key.
 
-Useful options:
-    --check-every N     check every N readings (default 30 serial, 10 listen)
+Optional extras:
+    Claude explanations   pip install anthropic, then set ANTHROPIC_API_KEY.
+                          Without a key, built-in rules check the readings.
+    Solana records        pip install solana solders, then add --chain.
+                          Warnings are written to Solana devnet (public, permanent).
+                          The first run creates agent-wallet.json; keep it private.
+
+Other options:
+    --listen PORT       use a different port (default 8765)
+    --port COM3         read the Arduino directly instead of through the browser
+                        (needs: pip install pyserial)
+    --check-every N     check every N readings (default 10, or 30 with --port)
     --rules             use the built-in rules even if an API key is set
-    --no-chain          don't write anything to Solana (handy while testing)
-    --rpc URL           Solana RPC endpoint (default devnet)
-
-On first run it creates agent-wallet.json and requests devnet SOL for it.
-Keep that file private: it is the wallet's secret key.
-Anything written on-chain is public and permanent.
+    --rpc URL           Solana RPC endpoint for --chain (default devnet)    
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -198,6 +198,141 @@ def clean_result(raw):
     return {"status": status, "reason": reason, "details": details, "sensors": sensors}
 
 
+def is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def rules_assess(readings):
+    """Checks the readings with fixed rules. Same result shape as Claude's."""
+    readings = [r for r in readings if isinstance(r, dict) and is_number(r.get("t"))]
+    if len(readings) < 3:
+        return {"status": "ok", "reason": "Not enough readings yet to judge.",
+                "details": "", "sensors": []}
+
+    issues = []   # (rank, status, reason, advice)
+    sensors = []
+    t_last = readings[-1]["t"]
+
+    def flag(status, reason, advice):
+        issues.append((2 if status == "critical" else 1, status, reason, advice))
+
+    # Gaps in the data.
+    ts = [r["t"] for r in readings]
+    diffs = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if diffs:
+        typical = median(diffs)
+        gap = max(diffs)
+        if gap > max(5.0, typical * 5):
+            flag("warning", f"Readings stopped for {gap:.0f}s at one point.",
+                 "Check the USB cable and that the sketch isn't freezing or resetting.")
+
+    fields = []
+    for r in readings:
+        for k in r:
+            if k != "t" and k not in fields:
+                fields.append(k)
+
+    for f in fields:
+        pts = [(r["t"], r[f]) for r in readings if f in r]
+        vals = [v for _, v in pts]
+
+        # A field that was sent before but not in the latest readings.
+        if len(readings) >= 8 and all(f not in r for r in readings[-5:]):
+            flag("warning", f"'{f}' stopped appearing in the readings.",
+                 "Check the sketch still prints it and the sensor is still connected.")
+
+        if all(isinstance(v, bool) for v in vals):
+            sensors.append(f"{f}: on/off input, likely a push button" if "button" in f.lower()
+                           else f"{f}: on/off input")
+            # How long it has been continuously on.
+            start = None
+            for t, v in reversed(pts):
+                if not v:
+                    break
+                start = t
+            held = (t_last - start) if (start is not None and pts[-1][1]) else 0
+            if held >= 30:
+                flag("critical", f"{f} has been on for {held:.0f}s without release.",
+                     "Check whether the button is stuck or something is pressing it, or whether the input is wired so it reads pressed all the time.")
+            elif held >= 8:
+                flag("warning", f"{f} has been held on for {held:.0f}s.",
+                     "If nobody is holding it, check for a stuck button or a short to the input pin.")
+            # Rapid switching (chatter / bouncing) in the last 10 seconds.
+            recent = [v for t, v in pts if t >= t_last - 10]
+            changes = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+            if changes >= 6:
+                flag("warning", f"{f} switched on/off {changes} times in 10s.",
+                     "That looks like contact bounce or a loose wire. Use INPUT_PULLUP and add a short debounce in the sketch.")
+            continue
+
+        nums = [(t, float(v)) for t, v in pts if is_number(v)]
+        if not nums:
+            sensors.append(f"{f}: text or other non-numeric value")
+            continue
+        xs = [v for _, v in nums]
+        analog = all(v.is_integer() and 0 <= v <= 1023 for v in xs)
+        sensors.append(f"{f}: raw analog input (0-1023), e.g. a potentiometer or light sensor"
+                       if analog else f"{f}: numeric reading")
+        latest = xs[-1]
+
+        # Pinned at 0 or full scale.
+        tail = xs[-5:]
+        railed = analog and len(tail) == 5 and len(set(tail)) == 1 and tail[0] in (0, 1023)
+        if railed:
+            flag("warning", f"{f} is stuck at {int(tail[0])}, the end of its range.",
+                 "A reading pinned at 0 or 1023 usually means a loose or shorted wire, or nothing connected to that pin.")
+
+        # Flatlined: a long run of identical values after the field was varying.
+        if not railed and len(xs) >= 25 and len(set(xs[-20:])) == 1 and len(set(xs[:-20])) > 2:
+            flag("warning", f"{f} hasn't changed in the last 20 readings (stuck at {latest:g}).",
+                 "If it's a knob nobody is touching, that's fine. Otherwise check the sensor's connection; a frozen value often means it stopped responding.")
+
+        # Sudden spike in the newest value.
+        prev = xs[:-1]
+        if len(prev) >= 8 and not railed:
+            med = median(prev)
+            mad = median(abs(v - med) for v in prev)
+            floor = 20.0 if analog else 1e-9
+            scale = max(1.4826 * mad, floor)
+            recent_med = median(prev[-5:])  # a new steady level (e.g. a knob turned) isn't a spike
+            if (abs(latest - med) > 8 * scale and abs(latest - med) > (50 if analog else 0)
+                    and abs(latest - recent_med) > 8 * scale):
+                flag("warning", f"{f} jumped to {latest:g} (usually about {med:g}).",
+                     "A one-off jump is often electrical noise or a loose wire; check it if it keeps happening.")
+
+        # Slow, steady drift across the window.
+        if len(nums) >= 10 and nums[-1][0] - nums[0][0] >= 20:
+            t0 = nums[0][0]
+            tx = [t - t0 for t, _ in nums]
+            mt, mx = sum(tx) / len(tx), sum(xs) / len(xs)
+            sxx = sum((t - mt) ** 2 for t in tx)
+            if sxx > 0:
+                slope = sum((t - mt) * (v - mx) for t, v in zip(tx, xs)) / sxx
+                fit = [mx + slope * (t - mt) for t in tx]
+                ss_res = sum((v - p) ** 2 for v, p in zip(xs, fit))
+                ss_tot = sum((v - mx) ** 2 for v in xs) or 1e-9
+                change = slope * (tx[-1] - tx[0])
+                # Real drift is still going; a knob turned and then left alone has stopped.
+                recent = xs[-1] - xs[-10]
+                still_moving = recent * change > 0 and abs(recent) > max(30 if analog else 0, 0.15 * abs(change))
+                if abs(change) > (150 if analog else 0) and 1 - ss_res / ss_tot > 0.8 and still_moving:
+                    flag("warning", f"{f} is drifting steadily {'up' if change > 0 else 'down'} ({change:+.0f} over {tx[-1]:.0f}s).",
+                         "If you aren't adjusting it, check for a warming component, a failing sensor, or a loose connection.")
+
+    if not issues:
+        return {"status": "ok",
+                "reason": (f"All {len(fields)} fields look" if len(fields) != 1 else f"'{fields[0]}' looks")
+                          + f" normal over the last {len(readings)} readings.",
+                "details": "No stuck button, bouncing, flatlined, maxed-out, spiking or drifting values, and no gaps in the data.",
+                "sensors": sensors}
+
+    issues.sort(key=lambda i: -i[0])
+    _, status, reason, advice = issues[0]
+    others = " ".join(i[2] for i in issues[1:])
+    details = advice + (f" Also: {others}" if others else "")
+    return {"status": status, "reason": reason[:200], "details": details[:800], "sensors": sensors}
+
+
 def assess(claude, readings):
     msg = claude.messages.create(
         model=MODEL,
@@ -212,8 +347,9 @@ def assess(claude, readings):
 
 
 class Monitor:
-    def __init__(self, claude, chain, check_every):
-        self.claude = claude
+    def __init__(self, check, engine, chain, check_every):
+        self.check = check          # function(readings) -> result dict
+        self.engine = engine        # "claude" or "rules"
         self.chain = chain
         self.check_every = check_every
         self.readings = deque(maxlen=WINDOW)
@@ -235,7 +371,7 @@ class Monitor:
         self.assessing = False
         threading.Thread(target=self._worker, daemon=True).start()
 
-    # Called for every reading. Returns immediately; Claude runs in the background.
+    # Called for every reading. Returns immediately; checks run in the background.
     def ingest(self, reading):
         with self.lock:
             reading = dict(reading)
@@ -253,7 +389,8 @@ class Monitor:
                 events_received=self.count,
                 assessing=self.assessing,
                 check_every=self.check_every,
-                model=MODEL,
+                engine=self.engine,
+                model=MODEL if self.engine == "claude" else None,
                 chain_enabled=self.chain is not None,
                 cluster=self.chain.cluster if self.chain else None,
                 wallet=self.chain.address if self.chain else None,
@@ -268,12 +405,13 @@ class Monitor:
                 snapshot = list(self.readings)
                 self.assessing = True
             try:
-                result = assess(self.claude, snapshot)
+                result = self.check(snapshot)
             except Exception as e:
-                log(f"Claude request failed: {e}")
+                what = "Claude request" if self.engine == "claude" else "Check"
+                log(f"{what} failed: {e}")
                 with self.lock:
                     self.assessing = False
-                    self.result = {**self.result, "agent_error": f"Last Claude request failed: {e}"[:300]}
+                    self.result = {**self.result, "agent_error": f"Last {what.lower()} failed: {e}"[:300]}
                 continue
             result.update(assessed_at=now_iso(), readings_assessed=len(snapshot),
                           signature=None, chain_error=None, agent_error=None)
@@ -308,9 +446,9 @@ class Monitor:
 
 def make_handler(monitor):
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, code, body=b"{}"):
+        def _send(self, code, body=b"{}", content_type="application/json"):
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -333,6 +471,8 @@ def make_handler(monitor):
                 self._json(200, monitor.status())
             elif path in ("/", "/health"):
                 self._json(200, {"agent": "running", "endpoints": ["GET /status", "POST /event"]})
+            elif path == "/favicon.ico":
+                self._send(204, b"", "image/x-icon")
             else:
                 self._json(404, {"error": "not found"})
 
@@ -397,48 +537,76 @@ def run_serial(monitor, port, baud):
 
 def main():
     ap = argparse.ArgumentParser(description="Arduino monitoring agent")
-    ap.add_argument("--port", help="serial port; the agent reads the Arduino directly")
+    ap.add_argument("--port", help="serial port; the agent reads the Arduino directly (needs pyserial)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--listen", type=int, metavar="PORT",
-                    help="HTTP port to receive readings from dashboard.html")
+                    help="port that receives readings from dashboard.html (default 8765)")
     ap.add_argument("--check-every", type=int,
-                    help=f"ask Claude every N readings (default {CHECK_EVERY} serial, {CHECK_EVERY_LISTEN} listen)")
-    ap.add_argument("--no-chain", action="store_true", help="don't log anything to Solana")
+                    help=f"check every N readings (default {CHECK_EVERY_LISTEN}, or {CHECK_EVERY} with --port)")
+    ap.add_argument("--rules", action="store_true",
+                    help="use the built-in rules instead of Claude, even if an API key is set")
+    ap.add_argument("--chain", action="store_true",
+                    help="record warnings on Solana (needs: pip install solana solders)")
+    ap.add_argument("--no-chain", action="store_true", help=argparse.SUPPRESS)  # old flag; off is now the default
     ap.add_argument("--rpc", default=os.environ.get("SOLANA_RPC_URL", DEFAULT_RPC),
-                    help="Solana RPC URL (default devnet)")
+                    help="Solana RPC URL for --chain (default devnet)")
     args = ap.parse_args()
-    if bool(args.port) == bool(args.listen):
-        ap.error("choose exactly one of --port or --listen")
+    if args.port and args.listen:
+        ap.error("choose either --port or --listen, not both")
+    if not args.port and not args.listen:
+        args.listen = 8765
     if args.check_every is not None and args.check_every < 1:
         ap.error("--check-every must be at least 1")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY is not set. Set it in this terminal, then run again.")
-    claude = anthropic.Anthropic()
+    # Pick who checks the readings: Claude if a key is set, otherwise the built-in rules.
+    engine, check = "rules", rules_assess
+    if args.rules:
+        log("Using the built-in rules (--rules).")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
+        log("No ANTHROPIC_API_KEY set, so readings are checked with the built-in rules (no AI).")
+    else:
+        try:
+            import anthropic
+            claude = anthropic.Anthropic()
+            engine, check = "claude", lambda readings: assess(claude, readings)
+        except ImportError:
+            log("ANTHROPIC_API_KEY is set but the anthropic package isn't installed "
+                "(pip install anthropic). Using the built-in rules for now.")
 
     chain = None
-    if not args.no_chain:
+    if args.chain:
         try:
             chain = Chain(args.rpc)
         except ImportError:
-            sys.exit("Missing package for Solana logging: pip install solana solders "
-                     "(or run with --no-chain)")
+            sys.exit("Solana recording needs two packages: python3 -m pip install solana solders "
+                     "(Windows: py -m pip install solana solders). Or run without --chain.")
         if chain.cluster == "mainnet-beta":
             log("WARNING: logging to Solana mainnet costs real SOL for every alert.")
         chain.ensure_funded()
 
-    monitor = Monitor(claude, chain, args.check_every or (CHECK_EVERY_LISTEN if args.listen else CHECK_EVERY))
+    monitor = Monitor(check, engine, chain,
+                      args.check_every or (CHECK_EVERY_LISTEN if args.listen else CHECK_EVERY))
+    checker = MODEL if engine == "claude" else "the built-in rules"
+    summary = (f"Checking every {monitor.check_every} readings with {checker}. "
+               f"Solana recording: {'on, ' + chain.cluster if chain else 'off (add --chain to turn it on)'}.")
 
     if args.listen:
-        server = ThreadingHTTPServer(("127.0.0.1", args.listen), make_handler(monitor))
-        log(f"Agent listening on http://localhost:{args.listen}  (Ctrl+C to stop)")
-        log(f"Assessing every {monitor.check_every} readings with {MODEL}. "
-            f"Solana logging: {'on, ' + chain.cluster if chain else 'off'}.")
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", args.listen), make_handler(monitor))
+        except OSError as e:
+            if e.errno in (errno.EADDRINUSE, 10048):
+                sys.exit(f"Port {args.listen} is already in use, probably by an agent running in another "
+                         f"terminal window. Close that window (or press Ctrl+C in it) and try again.")
+            raise
+        log(f"Agent running at http://localhost:{args.listen}  (the page sends readings here)")
+        log(summary)
+        log("Leave this window open. Press Ctrl+C to stop.")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             log("Stopped.")
     else:
+        log(summary)
         try:
             run_serial(monitor, args.port, args.baud)
         except KeyboardInterrupt:
