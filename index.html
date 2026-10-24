@@ -64,16 +64,15 @@ ol{padding-left:22px}li{margin:6px 0}
   <span class="badge">NO ASSESSMENT</span>
   <p class="reason">No assessment yet.</p>
 </div>
-<small>With forwarding enabled, the latest fresh reading is sent once per second. The agent assesses every 10 forwarded readings by default, using Claude if it has an API key (readings are then sent to Anthropic) or its built-in rules if not. It automatically records warning and critical results on Solana devnet, where they are public. Stop forwarding to stop sending new data; an in-progress request may still finish. This page cannot retrieve the Arduino's source code.</small>
+<small>With forwarding enabled, the latest fresh reading is sent once per second. The agent assesses every 10 forwarded readings by default, using Claude if it has an API key (readings are then sent to Anthropic) or its built-in rules if not. If the agent is started with <code>--chain</code>, it also records warning and critical results on Solana devnet, where they are public. Stop forwarding to stop sending new data; an in-progress request may still finish. This page cannot retrieve the Arduino's source code.</small>
 
 <details id="howto">
 <summary>How to start the agent</summary>
 <ol>
-<li>Install the packages once: <code>python3 -m pip install pyserial solana solders</code> (Windows: <code>py -m pip install pyserial solana solders</code>)</li>
-<li>Optional, for Claude's explanations: <code>pip install anthropic</code> and set <code>ANTHROPIC_API_KEY</code> in the terminal. Without a key the agent uses its built-in rules.</li>
-<li>Start the agent: <code>python3 Agent.py --listen 8765</code> (Windows: <code>py Agent.py --listen 8765</code>) and leave that terminal open. Add <code>--no-chain</code> to skip Solana while testing.</li>
-<li>In a second terminal, in the folder with this file: <code>python3 -m http.server 8000</code> (Windows: <code>py -m http.server 8000</code>), then open <a href="http://localhost:8000/dashboard.html">http://localhost:8000/dashboard.html</a> in Chrome or Edge.</li>
+<li>Agent: in a terminal, go to the folder with <code>Agent.py</code> and run <code>python3 Agent.py</code> (Windows: <code>py Agent.py</code>). Leave that window open. No packages or API key needed.</li>
+<li>Page: in a second terminal, go to the folder with this file and run <code>python3 -m http.server 8000</code> (Windows: <code>py -m http.server 8000</code>), then open <a href="http://localhost:8000/dashboard.html">http://localhost:8000/dashboard.html</a> in Chrome or Edge.</li>
 <li>Close the Arduino IDE's Serial Monitor, click <b>Connect Arduino</b>, then <b>Start forwarding to agent</b>.</li>
+<li>Optional: for Claude's explanations, <code>pip install anthropic</code> and set <code>ANTHROPIC_API_KEY</code> before starting the agent. To record warnings on Solana devnet, <code>pip install solana solders</code> and start it with <code>python3 Agent.py --chain</code>.</li>
 </ol>
 </details>
 </section>
@@ -91,7 +90,7 @@ let forwarding = false, agentBase, sentSequence = 0, agentBusy = false, agentGen
     notes.push('This browser can\'t read USB serial devices. Open this page in desktop Chrome or Edge (Safari and Firefox don\'t support Web Serial).');
   }
   if (location.protocol === 'file:') {
-    notes.push('This page was opened as a file. Serve it from localhost instead so the browser allows it to reach the agent: run "python -m http.server 8000" in this folder and open http://localhost:8000/dashboard.html.');
+    notes.push('This page was opened as a file. Serve it from localhost instead so the browser allows it to reach the agent: run "python3 -m http.server 8000" (Windows: "py -m http.server 8000") in this folder and open http://localhost:8000/dashboard.html.');
   } else if (location.protocol === 'https:') {
     notes.push('This page is served over HTTPS. To reach an agent on http://localhost, allow local network access when the browser asks. If it never asks, serve this page from localhost instead.');
   }
@@ -270,7 +269,7 @@ el('startAgent').addEventListener('click', async () => {
   } catch (error) {
     if (generation !== agentGeneration) return;
     forwarding = false;
-    el('agentStatus').textContent = `Agent unavailable: ${error.message}. Start it with "python3 Agent.py --listen 8765" (Windows: "py Agent.py --listen 8765") and leave that terminal open (see "How to start the agent" below).`;
+    el('agentStatus').textContent = `Agent unavailable: ${error.message}. Start it with "python3 Agent.py" (Windows: "py Agent.py") in the folder that holds Agent.py, and leave that terminal open (see "How to start the agent" below).`;
     el('howto').open = true;
   } finally { agentBusy = false; updateControls(); }
 });
